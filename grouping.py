@@ -395,10 +395,39 @@ def build_map(dfw: pd.DataFrame, K: int):
         )
         marker.add_to(fg_points[g])
 
-    # Search by tooltip text (works decently)
+    # Global search index (so search works across ALL groups, not only group 0)
+    fg_search = folium.FeatureGroup(name="(Search Index)", show=False)
+    m.add_child(fg_search)
+
+    # Add invisible markers to search layer
+    for _, r in dfw.iterrows():
+        lat = float(r["lat"])
+        lon = float(r["long"])
+        name = str(r["nama_toko"])
+        g = int(r["_gidx"])
+        gmaps = f"https://www.google.com/maps?q={lat},{lon}"
+        html = f'''
+        <div style="font-size:13px">
+          <b>{name}</b><br/>
+          Group: <b>{label_from_gidx(g)}</b><br/>
+          Lat: {lat}<br/>
+          Long: {lon}<br/>
+          <a href="{gmaps}" target="_blank" rel="noopener noreferrer">
+            🧭 Go to Google Maps
+          </a>
+        </div>
+        '''
+        folium.Marker(
+            location=[lat, lon],
+            tooltip=name,
+            popup=folium.Popup(html, max_width=320),
+            icon=folium.DivIcon(html=""),  # invisible icon
+        ).add_to(fg_search)
+
+    # Search by tooltip text (GLOBAL)
     try:
         Search(
-            layer=fg_points[0],
+            layer=fg_search,
             search_label="tooltip",
             placeholder="Cari nama toko ...",
             collapsed=False,

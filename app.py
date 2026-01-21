@@ -17,7 +17,7 @@ from grouping import (
 )
 
 st.set_page_config(page_title="JKS Grouping", layout="wide")
-st.markdown("### 🧪 DEV VERSION (TEST ONLY) — DO NOT SHARE TO USERS", unsafe_allow_html=True)
+
 st.title("🧭 JKS Grouping — Web-based Excel to Grouping Map")
 
 # -------------------------
@@ -44,13 +44,14 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.getvalue()
 
 def hash_uploaded_file(uploaded_file) -> str:
+    # Streamlit UploadedFile provides getvalue()
     b = uploaded_file.getvalue()
     return hashlib.md5(b).hexdigest()
 
 def init_session():
     st.session_state.file_hash = None
     st.session_state.df_clean = None     # cleaned input (nama_toko/lat/long + _row_id)
-    st.session_state.df_work = None      # SINGLE source of truth (refine/override committed)
+    st.session_state.df_work = None      # SINGLE source of truth for current result (refine/override committed)
     st.session_state.override_map = {}   # row_id(str) -> gidx(int)
 
 if "df_work" not in st.session_state:
@@ -80,6 +81,7 @@ if uploaded_file is None:
 # -------------------------
 current_hash = hash_uploaded_file(uploaded_file)
 if st.session_state.file_hash != current_hash:
+    # New file content => full reset
     init_session()
     st.session_state.file_hash = current_hash
 
@@ -137,6 +139,9 @@ st.dataframe(
     width="stretch",
 )
 
+# =========================================================
+# Refine & Override Flow Rules (clarity)
+# =========================================================
 with st.expander("🧠 Rules yang dipakai sistem (biar nggak 'balik ke versi lama')", expanded=False):
     st.markdown(
         """
@@ -188,11 +193,12 @@ if apply_btn:
     else:
         target_g = parse_label_to_gidx(target_label)
 
+        # Update override_map (last write wins)
         for s in selected:
             rid = s.split("id=")[-1].strip()
             st.session_state.override_map[str(rid)] = int(target_g)
 
-        # ✅ Apply override to LATEST committed result (df_work), not base
+        # Apply override to LATEST committed result (df_work), not base
         df_over, applied, skipped = apply_overrides(
             st.session_state.df_work.copy(),
             override_map=st.session_state.override_map,
@@ -209,6 +215,7 @@ if apply_btn:
             "Sistem tidak refine otomatis. (Kalau refine lagi, override dianggap LOCKED)"
         )
 
+# show current overrides
 with st.expander("Lihat daftar override aktif"):
     if not st.session_state.override_map:
         st.write("- belum ada override -")
