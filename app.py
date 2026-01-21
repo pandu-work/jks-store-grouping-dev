@@ -15,6 +15,7 @@ from grouping import (
 )
 
 st.set_page_config(page_title="JKS Store Grouping", layout="wide")
+st.markdown("### 🧪 DEV VERSION (TEST ONLY) — DO NOT SHARE TO USERS", unsafe_allow_html=True)
 st.title("📍 JKS Store Grouping")
 
 
