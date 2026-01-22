@@ -1,4 +1,3 @@
-# app.py
 import hashlib
 from io import BytesIO
 
@@ -9,268 +8,225 @@ import streamlit.components.v1 as components
 from grouping import (
     validate_input_df,
     initial_grouping,
-    apply_overrides,
     refine_from_current,
+    apply_overrides,
     build_map,
     label_from_gidx,
     parse_label_to_gidx,
 )
 
-st.set_page_config(page_title="JKS Grouping", layout="wide")
+# =============================
+# CONFIG
+# =============================
+st.set_page_config(page_title="JKS Store Grouping", layout="wide")
 
-st.title("🧭 JKS Grouping — Web-based Excel to Grouping Map")
+DEFAULT_K = 12
+DEFAULT_CAP = 25
 
-# -------------------------
-# Sidebar config
-# -------------------------
-st.sidebar.header("⚙️ Konfigurasi")
-K = st.sidebar.number_input("Jumlah Group (K)", min_value=1, max_value=200, value=8, step=1)
-CAP = st.sidebar.number_input("Cap max toko per group", min_value=1, max_value=5000, value=120, step=1)
-refine_on_init = st.sidebar.checkbox("Refine otomatis saat initial grouping", value=True)
-refine_iter_init = st.sidebar.slider("Refine iter (initial)", 0, 30, 3)
-neighbor_k = st.sidebar.slider("Neighbor-k (refine)", 5, 60, 12)
+# =============================
+# HELPERS
+# =============================
+def file_hash(uploaded_file) -> str:
+    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
 
-st.sidebar.divider()
-show_preview = st.sidebar.checkbox("Tampilkan preview tabel", value=True)
-preview_rows = st.sidebar.slider("Jumlah baris preview", 5, 200, 30)
-
-# -------------------------
-# Helper: export
-# -------------------------
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="grouped")
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="grouping")
     return bio.getvalue()
 
-def hash_uploaded_file(uploaded_file) -> str:
-    # Streamlit UploadedFile provides getvalue()
-    b = uploaded_file.getvalue()
-    return hashlib.md5(b).hexdigest()
-
-def init_session():
+def init_state():
     st.session_state.file_hash = None
-    st.session_state.df_clean = None     # cleaned input (nama_toko/lat/long + _row_id)
-    st.session_state.df_work = None      # SINGLE source of truth for current result (refine/override committed)
-    st.session_state.override_map = {}   # row_id(str) -> gidx(int)
+    st.session_state.df_base = None
+    st.session_state.df_current = None
+    st.session_state.override_map = {}
 
-if "df_work" not in st.session_state:
-    init_session()
+if "df_current" not in st.session_state:
+    init_state()
 
-# -------------------------
-# Front guidance BEFORE upload
-# -------------------------
-st.markdown("### 📌 Format file Excel yang harus di-upload")
+# =============================
+# TITLE
+# =============================
+st.title("🧭 JKS Store Grouping")
+
 st.markdown(
-    """
-- File: **.xlsx**
-- Minimal kolom: **nama_toko | lat | long**
-- **Lat/Long boleh pakai titik atau koma** (contoh: `-6.12345` atau `-6,12345`)
-- Kamu boleh refine berkali-kali sampai hasil pas, **baru** lakukan override.
+"""
+**Default sistem**
+- 12 group (R01–R12)
+- Kapasitas default: 25 toko / group  
+- Refine **manual saja**
+- Override **tidak auto-refine**
 """
 )
 
-uploaded_file = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
+# =============================
+# DUMMY TEMPLATE (WAJIB)
+# =============================
+st.subheader("📄 Contoh Format Excel")
+dummy = pd.DataFrame({
+    "nama_toko": ["Toko A", "Toko B", "Toko C"],
+    "lat": [-6.1201, -6.1212, -6.1223],
+    "long": [106.8801, 106.8792, 106.8783],
+})
+st.dataframe(dummy, use_container_width=True)
+st.download_button(
+    "⬇️ Download Template Excel",
+    data=df_to_excel_bytes(dummy),
+    file_name="template_jks_grouping.xlsx",
+)
 
-if uploaded_file is None:
-    st.info("Upload Excel dulu untuk mulai.")
+# =============================
+# SIDEBAR
+# =============================
+st.sidebar.header("⚙️ Konfigurasi")
+K = st.sidebar.number_input("Jumlah Group", 1, 50, DEFAULT_K)
+CAP = st.sidebar.number_input("Cap per Group", 1, 200, DEFAULT_CAP)
+refine_iter = st.sidebar.slider("Refine Iterasi", 1, 30, 3)
+neighbor_k = st.sidebar.slider("Neighbor-k", 5, 50, 12)
+
+# =============================
+# UPLOAD
+# =============================
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+if uploaded is None:
     st.stop()
 
-# -------------------------
-# Reset state if file content changes (NOT by filename)
-# -------------------------
-current_hash = hash_uploaded_file(uploaded_file)
-if st.session_state.file_hash != current_hash:
-    # New file content => full reset
-    init_session()
-    st.session_state.file_hash = current_hash
+fh = file_hash(uploaded)
+if st.session_state.file_hash != fh:
+    init_state()
+    st.session_state.file_hash = fh
 
-# -------------------------
-# Load & validate
-# -------------------------
-if st.session_state.df_clean is None:
-    try:
-        df_raw = pd.read_excel(uploaded_file)
-    except Exception as e:
-        st.error(f"Gagal baca Excel: {e}")
-        st.stop()
-
+# =============================
+# LOAD & VALIDATE
+# =============================
+if st.session_state.df_base is None:
+    df_raw = pd.read_excel(uploaded)
     ok, msg, df_clean = validate_input_df(df_raw)
     if not ok:
         st.error(msg)
         st.stop()
 
-    st.session_state.df_clean = df_clean
+    df_base, _, _ = initial_grouping(
+        df_clean,
+        K=int(K),
+        cap=int(CAP),
+        seed=42,
+    )
+    df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
 
-# -------------------------
-# Initial grouping (only once per file / reset)
-# -------------------------
-if st.session_state.df_work is None:
-    with st.spinner("Membuat grouping awal..."):
-        df_base, _m, _meta = initial_grouping(
-            st.session_state.df_clean.copy(),
-            K=int(K),
-            cap=int(CAP),
-            seed=42,
-            refine_on=bool(refine_on_init),
-            refine_iter=int(refine_iter_init),
-            neighbor_k=int(neighbor_k),
-            override_map={},  # no overrides at init
-        )
-        df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
-        st.session_state.df_work = df_base.copy()
+    st.session_state.df_base = df_base.copy()
+    st.session_state.df_current = df_base.copy()
 
-df_work = st.session_state.df_work
+df_current = st.session_state.df_current
 
-# -------------------------
-# Preview cleaned input
-# -------------------------
-if show_preview:
-    st.subheader("🔎 Preview data input (cleaned)")
-    st.dataframe(st.session_state.df_clean.head(preview_rows), width="stretch")
-
-# -------------------------
-# Summary
-# -------------------------
-st.subheader("✅ Ringkasan")
-st.write(f"Total titik diproses: **{len(df_work):,}**")
+# =============================
+# SUMMARY
+# =============================
+st.subheader("📊 Ringkasan Group")
 st.dataframe(
-    df_work["kategori"].value_counts().sort_index().rename_axis("kategori").to_frame("jumlah"),
-    width="stretch",
+    df_current["kategori"].value_counts().sort_index().to_frame("jumlah"),
+    use_container_width=True,
 )
 
-# =========================================================
-# Refine & Override Flow Rules (clarity)
-# =========================================================
-with st.expander("🧠 Rules yang dipakai sistem (biar nggak 'balik ke versi lama')", expanded=False):
-    st.markdown(
-        """
-**Source of truth = `df_work` (hasil terakhir yang sudah di-commit).**  
-- Klik **Refine** → hasil refine akan **menggantikan** `df_work` (commit).
-- Klik **Apply override** → override akan diterapkan ke **hasil terakhir** (`df_work`), **bukan** ke hasil awal.
-- Setelah override, refine **tidak otomatis** jalan. Kalau kamu refine lagi, toko yang sudah di-override dianggap **LOCKED** (tidak boleh pindah).
-- Upload file baru (konten beda) → semua state reset (refine/override hilang).
-"""
-    )
+# =============================
+# OVERRIDE UI
+# =============================
+st.subheader("🧷 Override Manual")
 
-# -------------------------
-# Override UI
-# -------------------------
-st.subheader("🧷 Override Manual (Opsional)")
-st.caption(
-    "Urutan ideal: **Refine beberapa kali sampai oke → baru override**. "
-    "Override diterapkan ke hasil **terakhir** (tidak akan rollback)."
-)
-
-df_show = df_work[["_row_id", "nama_toko", "lat", "long", "_gidx", "kategori"]].copy()
-df_show["pilihan"] = (
-    df_show["nama_toko"].astype(str)
+df_opt = df_current[["_row_id", "nama_toko", "kategori"]].copy()
+df_opt["label"] = (
+    df_opt["nama_toko"].astype(str)
     + " | "
-    + df_show["kategori"].astype(str)
+    + df_opt["kategori"]
     + " | id="
-    + df_show["_row_id"].astype(str)
+    + df_opt["_row_id"].astype(str)
 )
 
-with st.form("override_form", clear_on_submit=False):
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        selected = st.multiselect(
-            "Pilih toko yang mau di-override (pakai search di box ini):",
-            options=df_show["pilihan"].tolist(),
-        )
-    with col2:
-        target_label = st.selectbox(
-            "Pindahkan ke group:",
-            options=[label_from_gidx(i) for i in range(int(K))],
-            index=0,
-        )
+with st.form("override_form"):
+    selected = st.multiselect(
+        "Pilih toko:",
+        options=df_opt["label"].tolist(),
+    )
+    target_label = st.selectbox(
+        "Pindahkan ke group:",
+        options=[label_from_gidx(i) for i in range(int(K))],
+    )
+    apply_btn = st.form_submit_button("Apply Override")
 
-    apply_btn = st.form_submit_button("Apply override")
+if apply_btn and selected:
+    tgt = parse_label_to_gidx(target_label)
+    for s in selected:
+        rid = s.split("id=")[-1]
+        st.session_state.override_map[rid] = tgt
 
-if apply_btn:
-    if not selected:
-        st.warning("Belum pilih toko untuk di-override.")
-    else:
-        target_g = parse_label_to_gidx(target_label)
+    df_current, _, _ = apply_overrides(
+        df_current,
+        st.session_state.override_map,
+        K=int(K),
+        cap=int(CAP),
+    )
+    df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
+    st.session_state.df_current = df_current
 
-        # Update override_map (last write wins)
-        for s in selected:
-            rid = s.split("id=")[-1].strip()
-            st.session_state.override_map[str(rid)] = int(target_g)
-
-        # Apply override to LATEST committed result (df_work), not base
-        df_over, applied, skipped = apply_overrides(
-            st.session_state.df_work.copy(),
-            override_map=st.session_state.override_map,
-            K=int(K),
-            cap=int(CAP),
-        )
-        df_over["kategori"] = df_over["_gidx"].apply(label_from_gidx)
-
-        st.session_state.df_work = df_over
-        df_work = df_over
-
-        st.success(
-            f"Override applied: {applied} perubahan. Skipped: {skipped}. "
-            "Sistem tidak refine otomatis. (Kalau refine lagi, override dianggap LOCKED)"
-        )
-
-# show current overrides
-with st.expander("Lihat daftar override aktif"):
-    if not st.session_state.override_map:
-        st.write("- belum ada override -")
-    else:
-        tmp = [{"_row_id": rid, "forced_group": label_from_gidx(g)} for rid, g in st.session_state.override_map.items()]
-        st.dataframe(pd.DataFrame(tmp), width="stretch")
-
-# -------------------------
-# Refine section (manual)
-# -------------------------
-st.subheader("🧪 Refine Manual")
-colA, colB, colC = st.columns([1, 1, 2])
-with colA:
-    refine_btn = st.button("Refine sekarang")
-with colB:
-    refine_manual_iter = st.slider("Refine iter (manual)", 0, 30, 3)
-with colC:
-    st.caption(
-        "Refine akan berjalan di atas hasil **terakhir**. "
-        "Toko yang sudah di-override dianggap **LOCKED** dan tidak boleh pindah."
+# =============================
+# REMOVE OVERRIDE (WAJIB)
+# =============================
+st.markdown("### 🗑️ Hapus Override")
+if st.session_state.override_map:
+    rid_to_remove = st.multiselect(
+        "Pilih override yang ingin dihapus:",
+        options=list(st.session_state.override_map.keys()),
     )
 
-if refine_btn:
-    with st.spinner("Refining dari hasil terakhir (df_work)..."):
-        df_ref = refine_from_current(
-            st.session_state.df_work.copy(),
+    col1, col2 = st.columns(2)
+    if col1.button("Hapus Selected"):
+        for r in rid_to_remove:
+            st.session_state.override_map.pop(r, None)
+        df_current, _, _ = apply_overrides(
+            st.session_state.df_current,
+            st.session_state.override_map,
             K=int(K),
             cap=int(CAP),
-            refine_iter=int(refine_manual_iter),
-            neighbor_k=int(neighbor_k),
-            seed=42,
-            override_map=st.session_state.override_map,
         )
-        df_ref["kategori"] = df_ref["_gidx"].apply(label_from_gidx)
-        st.session_state.df_work = df_ref
-        df_work = df_ref
-    st.success("Refine manual selesai (committed).")
+        df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
+        st.session_state.df_current = df_current
 
-# -------------------------
-# Map
-# -------------------------
+    if col2.button("Hapus SEMUA Override"):
+        st.session_state.override_map = {}
+else:
+    st.caption("Belum ada override aktif")
+
+# =============================
+# REFINE (MANUAL ONLY)
+# =============================
+st.subheader("🧪 Refine Manual")
+if st.button("Refine Sekarang"):
+    df_ref = refine_from_current(
+        st.session_state.df_current,
+        K=int(K),
+        cap=int(CAP),
+        refine_iter=int(refine_iter),
+        neighbor_k=int(neighbor_k),
+        seed=42,
+        override_map=st.session_state.override_map,
+    )
+    df_ref["kategori"] = df_ref["_gidx"].apply(label_from_gidx)
+    st.session_state.df_current = df_ref
+    df_current = df_ref
+
+# =============================
+# MAP
+# =============================
 st.subheader("🗺️ Peta Grouping")
-folium_map = build_map(df_work, K=int(K))
-components.html(folium_map._repr_html_(), height=720, scrolling=True)
+m = build_map(df_current, K=int(K))
+components.html(m._repr_html_(), height=700)
 
-# -------------------------
-# Download
-# -------------------------
+# =============================
+# EXPORT
+# =============================
 st.subheader("⬇️ Download")
 st.download_button(
-    label="Download Excel hasil grouping (termasuk override)",
-    data=df_to_excel_bytes(df_work),
+    "Download Excel Hasil",
+    data=df_to_excel_bytes(df_current),
     file_name="hasil_grouping.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-
-with st.expander("Lihat tabel hasil (sample 200 baris)"):
-    st.dataframe(df_work.head(200), width="stretch")
