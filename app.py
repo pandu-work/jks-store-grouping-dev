@@ -1,5 +1,9 @@
+# app.py
+from __future__ import annotations
+
 import hashlib
 from io import BytesIO
+from typing import Dict, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -9,7 +13,7 @@ from grouping import (
     validate_input_df,
     initial_grouping,
     refine_from_current,
-    apply_overrides_to_current,  # <-- baru (apply ke df_current, bisa full rebuild dari df_base)
+    apply_overrides_to_current,
     build_map,
     label_from_gidx,
     parse_label_to_gidx,
@@ -19,16 +23,20 @@ st.set_page_config(page_title="JKS Store Grouping", layout="wide")
 
 DEFAULT_K = 12
 DEFAULT_CAP = 25
+DEFAULT_SEED = 42
+
 
 # ---------- helpers ----------
 def file_hash(uploaded_file) -> str:
     return hashlib.md5(uploaded_file.getvalue()).hexdigest()
+
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="grouping")
     return bio.getvalue()
+
 
 def init_state():
     st.session_state.file_hash = None
@@ -37,8 +45,34 @@ def init_state():
     st.session_state.df_current = None
     st.session_state.override_map = {}
 
+
 if "df_current" not in st.session_state:
     init_state()
+
+
+# ---------- caching ----------
+@st.cache_data(show_spinner=False)
+def cached_read_excel(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_excel(BytesIO(file_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def cached_validate(df_raw: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
+    return validate_input_df(df_raw)
+
+
+@st.cache_data(show_spinner=False)
+def cached_initial_grouping(df_clean: pd.DataFrame, K: int, cap: int, seed: int) -> Tuple[pd.DataFrame, dict]:
+    df_base, meta = initial_grouping(df_clean.copy(), K=K, cap=cap, seed=seed)
+    df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
+    meta_dict = {
+        "K": meta.K,
+        "cap": meta.cap,
+        "n_points": meta.n_points,
+        "cap_impossible": meta.cap_impossible,
+    }
+    return df_base, meta_dict
+
 
 # ---------- title ----------
 st.title("🧭 JKS Store Grouping")
@@ -74,41 +108,46 @@ st.sidebar.header("⚙️ Konfigurasi")
 K = st.sidebar.number_input("Jumlah Group", min_value=1, max_value=50, value=DEFAULT_K, step=1)
 CAP = st.sidebar.number_input("Cap per Group", min_value=1, max_value=500, value=DEFAULT_CAP, step=1)
 refine_iter = st.sidebar.slider("Refine Iterasi", 1, 30, 3)
-neighbor_k = st.sidebar.slider("Neighbor-k", 5, 50, 12)
 
 # ---------- upload ----------
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 if uploaded is None:
     st.stop()
 
-fh = file_hash(uploaded)
+file_bytes = uploaded.getvalue()
+fh = hashlib.md5(file_bytes).hexdigest()
+
+# Reset state only when file changes
 if st.session_state.file_hash != fh:
     init_state()
     st.session_state.file_hash = fh
 
 # ---------- load & validate ----------
 if st.session_state.df_clean is None:
-    df_raw = pd.read_excel(uploaded)
-    ok, msg, df_clean = validate_input_df(df_raw)
-    if not ok:
+    df_raw = cached_read_excel(file_bytes)
+    ok, msg, df_clean = cached_validate(df_raw)
+
+    if not ok or df_clean is None:
         st.error(msg)
         st.stop()
+
+    if msg:
+        st.info(msg)
+
     st.session_state.df_clean = df_clean
 
 # ---------- initial grouping (NO auto refine) ----------
 if st.session_state.df_base is None:
-    df_base, meta = initial_grouping(
+    df_base, meta = cached_initial_grouping(
         st.session_state.df_clean.copy(),
         K=int(K),
         cap=int(CAP),
-        seed=42,
+        seed=int(DEFAULT_SEED),
     )
-    df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
 
     st.session_state.df_base = df_base.copy()
     st.session_state.df_current = df_base.copy()
 
-    # warning kalau impossible memenuhi cap
     if meta.get("cap_impossible", False):
         st.warning(
             f"Total titik = {meta['n_points']:,} lebih besar dari K×cap = {meta['K']*meta['cap']:,}. "
@@ -122,21 +161,40 @@ st.subheader("📊 Ringkasan Group")
 counts = df_current["_gidx"].value_counts().sort_index()
 summary = pd.DataFrame({
     "kategori": [label_from_gidx(i) for i in range(int(K))],
-    "jumlah": [int(counts.get(i, 0)) for i in range(int(K))]
+    "jumlah": [int(counts.get(i, 0)) for i in range(int(K))],
 })
+summary["cap"] = int(CAP)
+summary["over_cap"] = summary["jumlah"] > summary["cap"]
+
+# show warning if any over cap
+if summary["over_cap"].any():
+    over = summary[summary["over_cap"]]
+    st.warning("Ada group yang melebihi cap. (Ini bisa terjadi karena cap impossible atau override).")
+
 st.dataframe(summary, use_container_width=True)
 
-# ---------- override apply (FORM: submit wajib) ----------
+# ---------- override apply ----------
 st.subheader("🧷 Override Manual")
 
 df_opt = df_current[["_row_id", "nama_toko", "_gidx"]].copy()
 df_opt["kategori"] = df_opt["_gidx"].apply(label_from_gidx)
-df_opt["label"] = df_opt["nama_toko"].astype(str) + " | " + df_opt["kategori"] + " | id=" + df_opt["_row_id"].astype(str)
 
-with st.form("override_form"):  # ✅ ada submit button
+# safer label formatting (avoid split bugs)
+df_opt["label"] = (
+    df_opt["nama_toko"].astype(str)
+    + " | "
+    + df_opt["kategori"].astype(str)
+    + " | id="
+    + df_opt["_row_id"].astype(str)
+)
+
+with st.form("override_form"):
     selected = st.multiselect("Pilih toko:", options=df_opt["label"].tolist())
-    target_label = st.selectbox("Pindahkan ke group:", options=[label_from_gidx(i) for i in range(int(K))])
-    apply_btn = st.form_submit_button("Apply Override")  # ✅ ini yang menghilangkan error "Missing Submit Button"
+    target_label = st.selectbox(
+        "Pindahkan ke group:",
+        options=[label_from_gidx(i) for i in range(int(K))]
+    )
+    apply_btn = st.form_submit_button("Apply Override")
 
 if apply_btn:
     if not selected:
@@ -147,14 +205,13 @@ if apply_btn:
             rid = s.split("id=")[-1].strip()
             st.session_state.override_map[rid] = int(tgt)
 
-        # ✅ apply override ke df_current (hasil terakhir)
+        # apply override to df_current (no rebuild / no rollback)
         df_current = apply_overrides_to_current(
             df_base=st.session_state.df_base,
             df_current=st.session_state.df_current,
             override_map=st.session_state.override_map,
             K=int(K),
-            cap=int(CAP),
-            mode="current_only",  # tidak rebuild dari base, tidak rollback
+            mode="current_only",
         )
         df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
         st.session_state.df_current = df_current
@@ -162,30 +219,30 @@ if apply_btn:
 
 # ---------- remove override ----------
 st.markdown("### 🗑️ Hapus Override (WAJIB)")
-
 if st.session_state.override_map:
     override_df = pd.DataFrame(
         [{"_row_id": k, "forced_group": label_from_gidx(v)} for k, v in st.session_state.override_map.items()]
     )
     st.dataframe(override_df, use_container_width=True)
 
-    to_remove = st.multiselect("Pilih override yang mau dihapus (_row_id):", options=list(st.session_state.override_map.keys()))
+    to_remove = st.multiselect(
+        "Pilih override yang mau dihapus (_row_id):",
+        options=list(st.session_state.override_map.keys())
+    )
 
     col1, col2 = st.columns(2)
+
     if col1.button("Hapus Selected"):
         for rid in to_remove:
             st.session_state.override_map.pop(rid, None)
 
-        # Setelah delete override: kita tidak auto-refine.
-        # Tapi kita harus membuat df_current konsisten dengan override_map terbaru.
-        # Cara aman: rebuild dari df_current TANPA rollback -> apply map yang tersisa.
+        # rebuild from base then apply remaining overrides
         df_current = apply_overrides_to_current(
             df_base=st.session_state.df_base,
             df_current=st.session_state.df_current,
             override_map=st.session_state.override_map,
             K=int(K),
-            cap=int(CAP),
-            mode="rebuild_from_base_then_apply",  # ini menghindari "sisa label override" yang sudah dihapus
+            mode="rebuild_from_base_then_apply",
         )
         df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
         st.session_state.df_current = df_current
@@ -193,7 +250,6 @@ if st.session_state.override_map:
 
     if col2.button("Hapus SEMUA Override"):
         st.session_state.override_map = {}
-        # rebuild dari base (ini bukan refine, hanya kembali ke baseline grouping awal)
         df_current = st.session_state.df_base.copy()
         df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
         st.session_state.df_current = df_current
@@ -209,9 +265,8 @@ if st.button("Refine Sekarang"):
         K=int(K),
         cap=int(CAP),
         refine_iter=int(refine_iter),
-        neighbor_k=int(neighbor_k),
-        seed=42,
-        override_map=st.session_state.override_map,  # locked points
+        seed=int(DEFAULT_SEED),
+        override_map=st.session_state.override_map,
     )
     df_ref["kategori"] = df_ref["_gidx"].apply(label_from_gidx)
     st.session_state.df_current = df_ref
