@@ -442,16 +442,18 @@ def build_map(df: pd.DataFrame, K: int) -> folium.Map:
                 color=color,
                 fill=True,
                 fill_opacity=0.85,
-                tooltip=name,
+                tooltip=f"{name} | {label_from_gidx(g)}",
                 popup=folium.Popup(popup_html, max_width=320),
             ).add_to(fg)
 
-            # invisible marker for global search
+            # invisible marker for global search (BUT with the SAME popup)
             folium.Marker(
-                location=[lat, lon],
-                tooltip=name,
-                icon=folium.DivIcon(html=""),
-            ).add_to(fg_search)
+              location=[lat, lon],
+              tooltip=f"{name} | {label_from_gidx(g)}",
+              popup=folium.Popup(popup_html, max_width=320),
+              icon=folium.DivIcon(html=""),
+              ).add_to(fg_search)
+
 
         # ===== Boundary / Hull WAJIB =====
         pts = list(zip(sub["long"].astype(float).tolist(), sub["lat"].astype(float).tolist()))
