@@ -11,8 +11,7 @@ import streamlit.components.v1 as components
 
 from grouping import (
     validate_input_df,
-    initial_grouping_sweep,
-    initial_grouping_kmeans_cap,
+    initial_grouping_balanced_compact,
     refine_from_current,
     apply_overrides_to_current,
     build_map,
@@ -27,16 +26,11 @@ DEFAULT_CAP = 25
 DEFAULT_SEED = 42
 
 
-# ---------- helpers ----------
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="grouping")
     return bio.getvalue()
-
-
-def file_hash(file_bytes: bytes) -> str:
-    return hashlib.md5(file_bytes).hexdigest()
 
 
 def init_state():
@@ -45,8 +39,6 @@ def init_state():
     st.session_state.df_base = None
     st.session_state.df_current = None
     st.session_state.override_map = {}
-    st.session_state.grouping_method = None
-    st.session_state.grouping_direction = None
     st.session_state.grouping_params = None
 
 
@@ -54,7 +46,6 @@ if "df_current" not in st.session_state:
     init_state()
 
 
-# ---------- caching ----------
 @st.cache_data(show_spinner=False)
 def cached_read_excel(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_excel(BytesIO(file_bytes))
@@ -65,23 +56,19 @@ def cached_validate(df_raw: pd.DataFrame):
     return validate_input_df(df_raw)
 
 
-# ---------- header ----------
 st.title("🧭 JKS Store Grouping")
 
 st.markdown(
 """
-Aplikasi ini membagi titik toko menjadi beberapa **Grup (R01–Rxx)**.
-
-✅ Cara pakai:
-1) Download template (opsional)  
-2) Upload file Excel  
-3) Klik **Buat Grouping**  
-4) Jika perlu, pindahkan toko pakai **Override**
+**Cara pakai (mudah):**
+1) Upload Excel  
+2) Klik **Buat Grouping**  
+3) (Opsional) Pindahkan toko pakai **Override**  
+4) Download hasil
 """
 )
 
-# ---------- template ----------
-with st.expander("📄 Download Template Excel (klik untuk buka)"):
+with st.expander("📄 Template Excel (kalau format kamu belum sesuai)"):
     dummy = pd.DataFrame({
         "nama_toko": ["Toko A", "Toko B", "Toko C"],
         "lat": [-6.1201, -6.1212, -6.1223],
@@ -95,124 +82,82 @@ with st.expander("📄 Download Template Excel (klik untuk buka)"):
         use_container_width=True,
     )
 
-# ---------- sidebar: simple controls ----------
+# Sidebar (simple)
 st.sidebar.header("⚙️ Pengaturan")
-
-method = st.sidebar.radio(
-    "Metode Pembagian Grup",
-    options=[
-        "Urut Stabil (mulai dari sudut, nyapu rapi) ✅",
-        "Kedekatan Titik (bisa ‘kelempar’ saat cap penuh)",
-    ],
-    index=0,
-)
-
-direction = st.sidebar.selectbox(
-    "Mulai dari sudut mana?",
-    options=[
-        ("NW_to_SE", "Kiri-Atas → Kanan-Bawah (NW → SE)"),
-        ("SW_to_NE", "Kiri-Bawah → Kanan-Atas (SW → NE)"),
-        ("NE_to_SW", "Kanan-Atas → Kiri-Bawah (NE → SW)"),
-        ("SE_to_NW", "Kanan-Bawah → Kiri-Atas (SE → NW)"),
-    ],
-    format_func=lambda x: x[1],
-    index=0,
-)[0]
-
 K = st.sidebar.number_input("Jumlah Grup (R01–Rxx)", min_value=1, max_value=50, value=DEFAULT_K, step=1)
-CAP = st.sidebar.number_input("Batas Toko per Grup (Cap)", min_value=1, max_value=500, value=DEFAULT_CAP, step=1)
+CAP = st.sidebar.number_input("Batas Maks Toko per Grup (Cap)", min_value=1, max_value=500, value=DEFAULT_CAP, step=1)
 
-st.sidebar.caption("Catatan: Jika total toko > (Jumlah Grup × Cap), maka cap tidak mungkin terpenuhi 100%.")
+st.sidebar.caption("Catatan: Kalau total toko > (Jumlah Grup × Cap), cap tidak mungkin terpenuhi 100%.")
 
-# refine control (will be disabled in sweep mode)
+# Refine manual at bottom sidebar (advanced)
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧪 Refine Manual")
-refine_iter = st.sidebar.slider("Kekuatan Refine (Iterasi)", 1, 30, 5)
+st.sidebar.subheader("🧪 Refine Manual (Opsional)")
+st.sidebar.caption("Gunakan hanya kalau kamu ingin merapikan lagi. Override tidak akan hilang.")
+refine_iter = st.sidebar.slider("Kekuatan Refine (Iterasi)", 1, 30, 8)
 refine_now = st.sidebar.button("Refine Sekarang", use_container_width=True)
 
-# ---------- upload ----------
+# Upload
 st.subheader("1) Upload Excel")
 uploaded = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
-
 if uploaded is None:
     st.info("Silakan upload Excel untuk mulai.")
     st.stop()
 
 file_bytes = uploaded.getvalue()
-fh = file_hash(file_bytes)
+fh = hashlib.md5(file_bytes).hexdigest()
 
-# reset state when file changes
+# reset if file changed
 if st.session_state.file_hash != fh:
     init_state()
     st.session_state.file_hash = fh
 
-# load & validate
+# validate
 if st.session_state.df_clean is None:
     df_raw = cached_read_excel(file_bytes)
-    ok, msg, df_clean, stats = cached_validate(df_raw)
-
+    ok, msg, df_clean, _stats = cached_validate(df_raw)
     if not ok or df_clean is None:
         st.error(msg)
         st.stop()
-
     st.success(msg)
     st.session_state.df_clean = df_clean
 
-# ---------- build grouping action button (explicit, non-confusing) ----------
+# Build grouping button (explicit)
 st.subheader("2) Buat Grouping")
-
 colA, colB = st.columns([1, 2])
 with colA:
     build_btn = st.button("✅ Buat Grouping", use_container_width=True)
 with colB:
     st.caption(
-        "Klik tombol ini setelah upload. "
-        "Aplikasi akan membuat grup awal. Kamu tetap bisa pindahkan toko (Override) setelahnya."
+        "Klik tombol ini setelah upload. Sistem akan membagi toko **rata dulu**, lalu merapikan agar tiap grup saling dekat."
     )
 
-# rebuild grouping if user clicks OR grouping not built yet OR method/params changed
-method_key = "sweep" if method.startswith("Urut Stabil") else "kmeans"
-params_key = (method_key, direction, int(K), int(CAP))
-
+params_key = (int(K), int(CAP))
 need_build = (st.session_state.df_base is None) or (st.session_state.grouping_params != params_key)
 
 if build_btn or need_build:
-    df_clean = st.session_state.df_clean.copy()
-
-    if method_key == "sweep":
-        df_base, meta = initial_grouping_sweep(
-            df_clean,
-            K=int(K),
-            cap=int(CAP),
-            direction=direction,
-        )
-    else:
-        df_base, meta = initial_grouping_kmeans_cap(
-            df_clean,
-            K=int(K),
-            cap=int(CAP),
-            seed=int(DEFAULT_SEED),
-        )
-
+    df_base, meta = initial_grouping_balanced_compact(
+        st.session_state.df_clean.copy(),
+        K=int(K),
+        cap=int(CAP),
+        seed=int(DEFAULT_SEED),
+        refine_iter=14,
+    )
     df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
 
     st.session_state.df_base = df_base.copy()
     st.session_state.df_current = df_base.copy()
     st.session_state.override_map = {}
-    st.session_state.grouping_method = method_key
-    st.session_state.grouping_direction = direction
     st.session_state.grouping_params = params_key
 
     if meta.cap_impossible:
         st.warning(
             f"Total titik = {meta.n_points:,} lebih besar dari (Jumlah Grup × Cap) = {meta.K * meta.cap:,}. "
-            "Artinya cap tidak bisa terpenuhi 100%. Sistem akan best-effort."
+            "Artinya cap tidak bisa terpenuhi 100%. Sistem tetap membuat grup sedekat mungkin (best-effort)."
         )
 
-# current df
 df_current = st.session_state.df_current
 
-# ---------- summary ----------
+# Summary
 st.subheader("📊 Ringkasan Grup")
 counts = df_current["_gidx"].value_counts().sort_index()
 summary = pd.DataFrame({
@@ -221,23 +166,17 @@ summary = pd.DataFrame({
 })
 summary["Cap"] = int(CAP)
 summary["Melebihi Cap?"] = summary["Jumlah Toko"] > summary["Cap"]
-
-if summary["Melebihi Cap?"].any():
-    st.warning("Ada grup yang melebihi cap. Ini bisa terjadi jika total toko > kapasitas, atau karena Override.")
-
 st.dataframe(summary, use_container_width=True)
 
-# ---------- override (simple for users) ----------
+# Override
 st.subheader("3) Pindahkan Toko (Override)")
-st.caption("Pilih toko lalu pilih grup tujuan. Override tidak akan hilang sampai kamu hapus.")
+st.caption("Pilih toko → pilih grup tujuan → klik Terapkan. Override akan menempel sampai kamu hapus.")
 
 df_opt = df_current[["_row_id", "nama_toko", "_gidx"]].copy()
 df_opt["Grup Saat Ini"] = df_opt["_gidx"].apply(label_from_gidx)
 df_opt["Pilihan"] = (
-    df_opt["nama_toko"].astype(str)
-    + " | "
-    + df_opt["Grup Saat Ini"].astype(str)
-    + " | id="
+    df_opt["nama_toko"].astype(str) + " | "
+    + df_opt["Grup Saat Ini"].astype(str) + " | id="
     + df_opt["_row_id"].astype(str)
 )
 
@@ -266,7 +205,6 @@ if apply_btn:
         st.session_state.df_current = df_current
         st.success("Override diterapkan.")
 
-# ---------- remove override (simple) ----------
 with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
     if st.session_state.override_map:
         override_df = pd.DataFrame(
@@ -275,8 +213,8 @@ with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
         st.dataframe(override_df, use_container_width=True)
 
         to_remove = st.multiselect("Pilih override yang mau dihapus (_row_id):", options=list(st.session_state.override_map.keys()))
-
         col1, col2 = st.columns(2)
+
         if col1.button("Hapus Selected", use_container_width=True):
             for rid in to_remove:
                 st.session_state.override_map.pop(rid, None)
@@ -298,39 +236,31 @@ with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
             df_current["kategori"] = df_current["_gidx"].apply(label_from_gidx)
             st.session_state.df_current = df_current
             st.success("Semua override dihapus.")
-
     else:
         st.info("Belum ada override yang aktif.")
 
-# ---------- refine manual (sidebar bottom) ----------
-# IMPORTANT: disable refine when using sweep mode because it breaks the ordered stability
+# Refine manual (sidebar bottom)
 if refine_now:
-    if st.session_state.grouping_method == "sweep":
-        st.warning(
-            "Refine dinonaktifkan untuk mode **Urut Stabil**, karena bisa membuat grup kembali ‘kelempar’. "
-            "Kalau kamu ingin refine, ubah metode ke **Kedekatan Titik** dulu."
-        )
-    else:
-        df_ref = refine_from_current(
-            st.session_state.df_current.copy(),
-            K=int(K),
-            cap=int(CAP),
-            refine_iter=int(refine_iter),
-            seed=int(DEFAULT_SEED),
-            override_map=st.session_state.override_map,
-        )
-        df_ref["kategori"] = df_ref["_gidx"].apply(label_from_gidx)
-        st.session_state.df_current = df_ref
-        st.success("Refine selesai.")
+    df_ref = refine_from_current(
+        st.session_state.df_current.copy(),
+        K=int(K),
+        cap=int(CAP),
+        refine_iter=int(refine_iter),
+        seed=int(DEFAULT_SEED),
+        override_map=st.session_state.override_map,
+    )
+    df_ref["kategori"] = df_ref["_gidx"].apply(label_from_gidx)
+    st.session_state.df_current = df_ref
+    st.success("Refine selesai.")
 
-# ---------- map ----------
+# Map
 st.subheader("🗺️ Peta Grup")
-st.caption("Kamu bisa cari toko lewat kolom pencarian di peta (search global).")
+st.caption("Klik titik (atau cari nama toko) untuk melihat detail dan membuka Google Maps.")
 
 m = build_map(st.session_state.df_current, K=int(K))
 components.html(m._repr_html_(), height=720, scrolling=True)
 
-# ---------- download ----------
+# Download
 st.subheader("4) Download Hasil")
 st.download_button(
     "⬇️ Download Excel Hasil",
