@@ -11,7 +11,9 @@ import streamlit.components.v1 as components
 
 from grouping import (
     validate_input_df,
+    initial_grouping_region_grow,
     initial_grouping_balanced_compact,
+    initial_grouping_kmeans_cap,
     refine_from_current,
     apply_overrides_to_current,
     build_map,
@@ -26,6 +28,9 @@ DEFAULT_CAP = 25
 DEFAULT_SEED = 42
 
 
+# -----------------------
+# Helpers
+# -----------------------
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
@@ -56,6 +61,9 @@ def cached_validate(df_raw: pd.DataFrame):
     return validate_input_df(df_raw)
 
 
+# -----------------------
+# UI Header
+# -----------------------
 st.title("🧭 JKS Store Grouping")
 
 st.markdown(
@@ -82,21 +90,44 @@ with st.expander("📄 Template Excel (kalau format kamu belum sesuai)"):
         use_container_width=True,
     )
 
-# Sidebar (simple)
+
+# -----------------------
+# Sidebar Settings (user-friendly)
+# -----------------------
 st.sidebar.header("⚙️ Pengaturan")
+
+method = st.sidebar.radio(
+    "Metode Pembagian Grup",
+    options=[
+        "Anti Campur (Wilayah Nyambung) ✅ (Rekomendasi)",
+        "Rata & Dekat (bisa campur di area padat)",
+        "Kedekatan saja (paling rawan ‘kelempar’)",
+    ],
+    index=0,
+)
+
 K = st.sidebar.number_input("Jumlah Grup (R01–Rxx)", min_value=1, max_value=50, value=DEFAULT_K, step=1)
 CAP = st.sidebar.number_input("Batas Maks Toko per Grup (Cap)", min_value=1, max_value=500, value=DEFAULT_CAP, step=1)
-
 st.sidebar.caption("Catatan: Kalau total toko > (Jumlah Grup × Cap), cap tidak mungkin terpenuhi 100%.")
 
-# Refine manual at bottom sidebar (advanced)
+# Advanced knob only for Anti Campur
+k_neighbors = 12
+if method.startswith("Anti Campur"):
+    with st.sidebar.expander("Pengaturan Lanjutan (opsional)", expanded=False):
+        st.caption("Kalau masih terasa ‘campur’, coba naikkan sedikit.")
+        k_neighbors = st.slider("Kekuatan Wilayah (k tetangga)", 6, 30, 12)
+
+# Refine manual at bottom sidebar
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧪 Refine Manual (Opsional)")
-st.sidebar.caption("Gunakan hanya kalau kamu ingin merapikan lagi. Override tidak akan hilang.")
+st.sidebar.caption("Override tidak akan hilang. Tapi refine bisa bikin area padat sedikit campur lagi.")
 refine_iter = st.sidebar.slider("Kekuatan Refine (Iterasi)", 1, 30, 8)
 refine_now = st.sidebar.button("Refine Sekarang", use_container_width=True)
 
+
+# -----------------------
 # Upload
+# -----------------------
 st.subheader("1) Upload Excel")
 uploaded = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
 if uploaded is None:
@@ -106,12 +137,14 @@ if uploaded is None:
 file_bytes = uploaded.getvalue()
 fh = hashlib.md5(file_bytes).hexdigest()
 
-# reset if file changed
 if st.session_state.file_hash != fh:
     init_state()
     st.session_state.file_hash = fh
 
-# validate
+
+# -----------------------
+# Validate
+# -----------------------
 if st.session_state.df_clean is None:
     df_raw = cached_read_excel(file_bytes)
     ok, msg, df_clean, _stats = cached_validate(df_raw)
@@ -121,27 +154,47 @@ if st.session_state.df_clean is None:
     st.success(msg)
     st.session_state.df_clean = df_clean
 
-# Build grouping button (explicit)
+
+# -----------------------
+# Build Grouping (explicit button)
+# -----------------------
 st.subheader("2) Buat Grouping")
+
 colA, colB = st.columns([1, 2])
 with colA:
     build_btn = st.button("✅ Buat Grouping", use_container_width=True)
 with colB:
     st.caption(
-        "Klik tombol ini setelah upload. Sistem akan membagi toko **rata dulu**, lalu merapikan agar tiap grup saling dekat."
+        "Klik tombol ini setelah upload. Sistem akan membuat grup awal sesuai metode yang dipilih."
     )
 
-params_key = (int(K), int(CAP))
+method_key = (
+    "region_grow" if method.startswith("Anti Campur")
+    else "balanced_compact" if method.startswith("Rata & Dekat")
+    else "kmeans_cap"
+)
+params_key = (method_key, int(K), int(CAP), int(k_neighbors))
 need_build = (st.session_state.df_base is None) or (st.session_state.grouping_params != params_key)
 
 if build_btn or need_build:
-    df_base, meta = initial_grouping_balanced_compact(
-        st.session_state.df_clean.copy(),
-        K=int(K),
-        cap=int(CAP),
-        seed=int(DEFAULT_SEED),
-        refine_iter=14,
-    )
+    df_clean = st.session_state.df_clean.copy()
+
+    if method_key == "region_grow":
+        df_base, meta = initial_grouping_region_grow(
+            df_clean, K=int(K), cap=int(CAP), seed=int(DEFAULT_SEED), k_neighbors=int(k_neighbors)
+        )
+        st.info("Mode Anti Campur aktif: grup dibentuk seperti wilayah yang nyambung (tidak campur-campur).")
+    elif method_key == "balanced_compact":
+        df_base, meta = initial_grouping_balanced_compact(
+            df_clean, K=int(K), cap=int(CAP), seed=int(DEFAULT_SEED), refine_iter=14
+        )
+        st.info("Mode Rata & Dekat: ukuran grup rata dulu, lalu dirapikan berdasarkan kedekatan.")
+    else:
+        df_base, meta = initial_grouping_kmeans_cap(
+            df_clean, K=int(K), cap=int(CAP), seed=int(DEFAULT_SEED)
+        )
+        st.warning("Mode ini lebih rawan ‘kelempar’ kalau cap ketat. Gunakan jika kamu memang butuh kedekatan murni.")
+
     df_base["kategori"] = df_base["_gidx"].apply(label_from_gidx)
 
     st.session_state.df_base = df_base.copy()
@@ -155,9 +208,13 @@ if build_btn or need_build:
             "Artinya cap tidak bisa terpenuhi 100%. Sistem tetap membuat grup sedekat mungkin (best-effort)."
         )
 
+
 df_current = st.session_state.df_current
 
+
+# -----------------------
 # Summary
+# -----------------------
 st.subheader("📊 Ringkasan Grup")
 counts = df_current["_gidx"].value_counts().sort_index()
 summary = pd.DataFrame({
@@ -168,9 +225,12 @@ summary["Cap"] = int(CAP)
 summary["Melebihi Cap?"] = summary["Jumlah Toko"] > summary["Cap"]
 st.dataframe(summary, use_container_width=True)
 
+
+# -----------------------
 # Override
+# -----------------------
 st.subheader("3) Pindahkan Toko (Override)")
-st.caption("Pilih toko → pilih grup tujuan → klik Terapkan. Override akan menempel sampai kamu hapus.")
+st.caption("Pilih toko → pilih grup tujuan → klik Terapkan. Override menempel sampai kamu hapus.")
 
 df_opt = df_current[["_row_id", "nama_toko", "_gidx"]].copy()
 df_opt["Grup Saat Ini"] = df_opt["_gidx"].apply(label_from_gidx)
@@ -205,6 +265,7 @@ if apply_btn:
         st.session_state.df_current = df_current
         st.success("Override diterapkan.")
 
+
 with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
     if st.session_state.override_map:
         override_df = pd.DataFrame(
@@ -212,7 +273,11 @@ with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
         )
         st.dataframe(override_df, use_container_width=True)
 
-        to_remove = st.multiselect("Pilih override yang mau dihapus (_row_id):", options=list(st.session_state.override_map.keys()))
+        to_remove = st.multiselect(
+            "Pilih override yang mau dihapus (_row_id):",
+            options=list(st.session_state.override_map.keys())
+        )
+
         col1, col2 = st.columns(2)
 
         if col1.button("Hapus Selected", use_container_width=True):
@@ -239,7 +304,10 @@ with st.expander("🗑️ Kelola Override (hapus override)", expanded=False):
     else:
         st.info("Belum ada override yang aktif.")
 
-# Refine manual (sidebar bottom)
+
+# -----------------------
+# Refine manual
+# -----------------------
 if refine_now:
     df_ref = refine_from_current(
         st.session_state.df_current.copy(),
@@ -253,14 +321,20 @@ if refine_now:
     st.session_state.df_current = df_ref
     st.success("Refine selesai.")
 
+
+# -----------------------
 # Map
+# -----------------------
 st.subheader("🗺️ Peta Grup")
-st.caption("Klik titik (atau cari nama toko) untuk melihat detail dan membuka Google Maps.")
+st.caption("Klik titik (atau cari nama toko) untuk melihat detail & buka Google Maps.")
 
 m = build_map(st.session_state.df_current, K=int(K))
 components.html(m._repr_html_(), height=720, scrolling=True)
 
+
+# -----------------------
 # Download
+# -----------------------
 st.subheader("4) Download Hasil")
 st.download_button(
     "⬇️ Download Excel Hasil",
